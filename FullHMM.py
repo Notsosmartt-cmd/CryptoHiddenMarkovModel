@@ -1,9 +1,10 @@
-# hmm_market_regime_analyzer.py
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import AgglomerativeClustering
+from scipy.cluster.hierarchy import dendrogram, linkage
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple, Dict, List
@@ -19,9 +20,9 @@ pd.set_option('display.max_colwidth', None)
 # ============================================================================
 class Config:
     """Configuration parameters for the analysis"""
-    TICKER = "ALGO-USD"
-    START_DATE = "2000-01-01"
-    END_DATE = "2025-12-30"
+    TICKER = "BTC-USD"
+    START_DATE = "2025-01-01"
+    END_DATE = "2026-01-03"
     N_STATES = 5  # Bullish Low Vol, Bullish High Vol, Bearish Low Vol, Bearish High Vol, Sideways
     AUC_WINDOW = 14
     FORECAST_STEPS = 5  # How many steps ahead to propagate
@@ -95,123 +96,187 @@ def train_hmm(X_scaled: np.ndarray, n_states: int) -> Tuple[GaussianHMM, np.ndar
 
 
 # ============================================================================
-# REGIME LABELING FUNCTIONS - TRANSITION BASED
+# REGIME LABELING FUNCTIONS - HIERARCHICAL CLUSTERING
 # ============================================================================
-def label_regimes_transition_based(state_stats: pd.DataFrame, transition_matrix: np.ndarray,
-                                   n_states: int) -> Dict[int, str]:
+def label_regimes_clustering(state_stats: pd.DataFrame, transition_matrix: np.ndarray,
+                             n_states: int) -> Tuple[Dict[int, str], np.ndarray]:
     """
-    Label HMM states with semantic regime names using transition based analysis.
+    Label HMM states using hierarchical clustering for guaranteed unique labels.
 
-    This approach analyzes the transition matrix structure to identify regimes:
-    1. Persistence: High self loop probability indicates stable regimes
-    2. Transition patterns: Which states commonly transition to each other
-    3. State characteristics: Returns and volatility as secondary features
+    Strategy:
+    1. Create a feature matrix from state characteristics
+    2. Apply hierarchical clustering with n_clusters = n_states
+    3. Label each cluster based on its centroid characteristics
+    4. Each state gets exactly one unique cluster assignment
     """
-    labels = {}
 
     # Extract transition matrix properties
-    persistence = np.diag(transition_matrix)  # Self-loop probabilities
-
-    # Calculate average duration in each state (inverse of exit probability)
+    persistence = np.diag(transition_matrix)
     avg_duration = np.array([1 / (1 - p) if p < 0.999 else 999 for p in persistence])
 
-    # Add transition based features to state_stats
+    # Calculate exit probabilities (sum of transitions to other states)
+    exit_probs = 1 - persistence
+
     state_stats['Persistence'] = persistence
     state_stats['Avg_Duration'] = avg_duration
+    state_stats['Exit_Prob'] = exit_probs
 
-    # Identify the most common transition target for each state (excluding self)
-    most_common_transition = []
-    for i in range(n_states):
-        trans_probs = transition_matrix[i].copy()
-        trans_probs[i] = 0  # Exclude self-loops
-        most_common_transition.append(np.argmax(trans_probs))
-    state_stats['Most_Common_Next'] = most_common_transition
+    # Create feature matrix for clustering
+    # Normalize features to put them on comparable scales
+    clustering_features = state_stats[['Log_Ret', 'Log_Range', 'Rolling_AUC', 'Persistence']].copy()
 
-    # Step 1: Classify by return direction (Bull/Bear/Sideways)
-    ret_threshold = 0.0005  # Threshold for "sideways" classification
-    state_stats['Direction'] = state_stats['Log_Ret'].apply(
-        lambda x: 'Bullish' if x > ret_threshold else ('Bearish' if x < -ret_threshold else 'Sideways')
-    )
+    # Standardize features for clustering
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(clustering_features)
 
-    # Step 2: Classify by volatility (Low/High) using median split
-    vol_median = state_stats['Log_Range'].median()
-    state_stats['Volatility'] = state_stats['Log_Range'].apply(
-        lambda x: 'High Vol' if x > vol_median else 'Low Vol'
-    )
-
-    # Step 3: Classify by persistence (Stable/Transitional)
-    persistence_threshold = np.median(persistence)
-    state_stats['Stability'] = state_stats['Persistence'].apply(
-        lambda x: 'Stable' if x > persistence_threshold else 'Transitional'
-    )
-
-    # Step 4: Assign semantic labels based on transition based analysis
-    for idx, row in state_stats.iterrows():
-        state_id = row['State']
-        direction = row['Direction']
-        volatility = row['Volatility']
-        stability = row['Stability']
-        persist = row['Persistence']
-
-        # Primary labeling based on direction and volatility
-        if direction == 'Sideways':
-            # Sideways states - distinguish by volatility and stability
-            if volatility == 'High Vol':
-                labels[state_id] = 'Sideways High Vol'
-            else:
-                labels[state_id] = 'Sideways Low Vol'
-        else:
-            # Bullish or Bearish states
-            base_label = f"{direction} {volatility}"
-
-            # Add stability qualifier for very persistent or very transitional states
-            if persist > 0.85:
-                labels[state_id] = f"{base_label}"  # Keep simple for very stable
-            elif persist < 0.5:
-                labels[state_id] = f"{base_label} (Transition)"
-            else:
-                labels[state_id] = base_label
-
-    # Step 5: Refine labels by analyzing transition patterns
-    # Group states that frequently transition to each other
-    transition_groups = {}
-    for i in range(n_states):
-        # Find states with mutual high transition probabilities
-        mutual_partners = []
-        for j in range(n_states):
-            if i != j and transition_matrix[i, j] > 0.2 and transition_matrix[j, i] > 0.2:
-                mutual_partners.append(j)
-
-        if mutual_partners:
-            transition_groups[i] = mutual_partners
-
-    # Optional: Merge similar labels if states have similar characteristics and strong transitions
-    # This helps identify regime "clusters" based on transition behavior
-    for state_id in range(n_states):
-        if state_id in transition_groups:
-            partners = transition_groups[state_id]
-            # Check if partners have similar characteristics
-            similar_direction = all(
-                state_stats.loc[state_stats['State'] == p, 'Direction'].values[0] ==
-                state_stats.loc[state_stats['State'] == state_id, 'Direction'].values[0]
-                for p in partners
-            )
-            if similar_direction and len(partners) > 0:
-                # Add a note about transition relationships
-                current_label = labels[state_id]
-                if "(Transition)" not in current_label and "Sideways" not in current_label:
-                    # These states form a transition cluster
-                    pass  # Keep labels as-is but note the relationship
-
-    # Print transition based analysis summary
-    print("\n📊 TRANSITION BASED REGIME ANALYSIS:")
+    print("\n📊 HIERARCHICAL CLUSTERING REGIME ANALYSIS:")
     print("-" * 80)
-    analysis_df = state_stats[['State', 'Log_Ret', 'Log_Range', 'Rolling_AUC', 'Persistence',
-                               'Avg_Duration', 'Direction', 'Volatility', 'Stability']].copy()
+    print("Clustering features: Log_Ret, Log_Range, Rolling_AUC, Persistence")
+
+    # Perform hierarchical clustering
+    clustering = AgglomerativeClustering(n_clusters=n_states, linkage='ward')
+    cluster_labels = clustering.fit_predict(features_scaled)
+
+    state_stats['Cluster'] = cluster_labels
+
+    # For each cluster, determine its semantic label based on characteristics
+    labels = {}
+    cluster_summaries = []
+
+    for cluster_id in range(n_states):
+        # Get states in this cluster
+        cluster_states = state_stats[state_stats['Cluster'] == cluster_id]
+
+        # Calculate cluster centroid characteristics
+        centroid_ret = cluster_states['Log_Ret'].mean()
+        centroid_vol = cluster_states['Log_Range'].mean()
+        centroid_auc = cluster_states['Rolling_AUC'].mean()
+        centroid_persist = cluster_states['Persistence'].mean()
+
+        # Classify direction
+        if centroid_ret > 0.001:
+            direction = 'Bullish'
+        elif centroid_ret < -0.001:
+            direction = 'Bearish'
+        else:
+            direction = 'Sideways'
+
+        # Classify volatility relative to all states
+        vol_rank = (state_stats['Log_Range'] < centroid_vol).sum()
+        if vol_rank <= n_states * 0.33:
+            volatility = 'Low Vol'
+        elif vol_rank <= n_states * 0.67:
+            volatility = 'Medium Vol'
+        else:
+            volatility = 'High Vol'
+
+        # Classify persistence
+        if centroid_persist > 0.75:
+            stability = 'Stable'
+        elif centroid_persist < 0.5:
+            stability = 'Transitional'
+        else:
+            stability = 'Normal'
+
+        # Classify momentum
+        if centroid_auc > state_stats['Rolling_AUC'].median():
+            momentum = 'Strong Momentum'
+        else:
+            momentum = 'Weak Momentum'
+
+        # Construct semantic label
+        base_label = f"{direction} {volatility}"
+
+        # Add stability qualifier if extreme
+        if stability == 'Transitional':
+            full_label = f"{base_label} (Transitional)"
+        elif stability == 'Stable' and direction != 'Sideways':
+            full_label = f"{base_label} (Stable)"
+        else:
+            full_label = base_label
+
+        # Assign label to all states in this cluster
+        for state_id in cluster_states['State'].values:
+            labels[state_id] = full_label
+
+        cluster_summaries.append({
+            'Cluster': cluster_id,
+            'Label': full_label,
+            'States': list(cluster_states['State'].values),
+            'Avg_Return': centroid_ret,
+            'Avg_Vol': centroid_vol,
+            'Avg_Persistence': centroid_persist
+        })
+
+    # Check for duplicate labels and refine if needed
+    label_values = list(labels.values())
+    if len(label_values) != len(set(label_values)):
+        print("⚠️  Detected duplicate labels after clustering, refining...")
+
+        # Add magnitude qualifiers based on return strength within each label group
+        label_groups = {}
+        for state_id, label in labels.items():
+            if label not in label_groups:
+                label_groups[label] = []
+            label_groups[label].append(state_id)
+
+        for label, state_ids in label_groups.items():
+            if len(state_ids) > 1:
+                # Sort by return magnitude
+                returns = [(sid, state_stats[state_stats['State'] == sid]['Log_Ret'].values[0])
+                           for sid in state_ids]
+                returns_sorted = sorted(returns, key=lambda x: abs(x[1]), reverse=True)
+
+                qualifiers = ['Strong', 'Moderate', 'Weak', 'Very Weak', 'Extremely Weak']
+                for i, (state_id, _) in enumerate(returns_sorted):
+                    if i < len(qualifiers):
+                        labels[state_id] = f"{qualifiers[i]} {label}"
+                    else:
+                        labels[state_id] = f"{label} (State {state_id})"
+
+    # Verify uniqueness
+    label_values = list(labels.values())
+    assert len(label_values) == len(set(label_values)), "ERROR: Labels are not unique!"
+
+    # Print cluster analysis
+    print("\nCluster Summary:")
+    for summary in cluster_summaries:
+        print(f"\nCluster {summary['Cluster']}: {summary['Label']}")
+        print(f"  States: {summary['States']}")
+        print(f"  Avg Return: {summary['Avg_Return']:.6f}")
+        print(f"  Avg Volatility: {summary['Avg_Vol']:.6f}")
+        print(f"  Avg Persistence: {summary['Avg_Persistence']:.4f}")
+
+    print("\n" + "-" * 80)
+    analysis_df = state_stats[['State', 'Log_Ret', 'Log_Range', 'Rolling_AUC',
+                               'Persistence', 'Avg_Duration', 'Cluster']].copy()
     analysis_df['Assigned_Label'] = analysis_df['State'].map(labels)
     print(analysis_df.to_string(index=False))
+    print("\n✅ All labels are unique (via hierarchical clustering)!")
 
-    return labels
+    return labels, features_scaled
+
+
+def plot_dendrogram(features_scaled: np.ndarray, state_stats: pd.DataFrame, labels: Dict[int, str]) -> None:
+    """Plot hierarchical clustering dendrogram"""
+    plt.figure(figsize=(12, 6))
+
+    # Create linkage matrix
+    linkage_matrix = linkage(features_scaled, method='ward')
+
+    # Create dendrogram
+    dendrogram(
+        linkage_matrix,
+        labels=[f"State {i}: {labels[i]}" for i in range(len(labels))],
+        leaf_font_size=10,
+        leaf_rotation=45
+    )
+
+    plt.title('Hierarchical Clustering Dendrogram of HMM States', fontsize=14, fontweight='bold')
+    plt.xlabel('State', fontsize=12)
+    plt.ylabel('Distance', fontsize=12)
+    plt.tight_layout()
+    plt.show()
 
 
 # ============================================================================
@@ -301,8 +366,8 @@ def plot_results(df: pd.DataFrame, forward_probs: np.ndarray, trans_df: pd.DataF
         idx = df[df['Regime'] == state].index
         ax1.scatter(idx, df.loc[idx, 'Close'], label=labels[state], s=10, alpha=0.7)
 
-    ax1.set_title(f"{config.TICKER} Price Action Classified by HMM Regime (Transition Based)", fontsize=14,
-                  fontweight='bold')
+    ax1.set_title(f"{config.TICKER} Price Action Classified by HMM Regime (Hierarchical Clustering)",
+                  fontsize=14, fontweight='bold')
     ax1.set_ylabel("Price")
     ax1.legend(loc='upper left', markerscale=3, ncol=5)
     ax1.grid(alpha=0.3)
@@ -408,7 +473,7 @@ def print_transition_matrix_analysis(model: GaussianHMM, labels: Dict[int, str])
     for i in range(model.n_components):
         persistence = model.transmat_[i, i]
         avg_duration = 1 / (1 - persistence) if persistence < 0.999 else float('inf')
-        print(f"  {labels[i]:30s}: {persistence:.4f} (avg duration: {avg_duration:.1f} days)")
+        print(f"  {labels[i]:40s}: {persistence:.4f} (avg duration: {avg_duration:.1f} days)")
 
     # Most likely transitions
     print("\nMost Likely Regime Transitions (excluding persistence):")
@@ -416,7 +481,7 @@ def print_transition_matrix_analysis(model: GaussianHMM, labels: Dict[int, str])
         trans_probs = model.transmat_[i].copy()
         trans_probs[i] = 0
         most_likely_next = np.argmax(trans_probs)
-        print(f"  {labels[i]:30s} → {labels[most_likely_next]:30s}: {trans_probs[most_likely_next]:.4f}")
+        print(f"  {labels[i]:40s} → {labels[most_likely_next]:40s}: {trans_probs[most_likely_next]:.4f}")
 
 
 # ============================================================================
@@ -426,7 +491,7 @@ def main():
     """Main function to run the HMM market regime analysis"""
     print("=" * 80)
     print(f"TRAINING MULTIVARIATE HMM FOR {Config.TICKER}")
-    print(f"Regime Labeling: TRANSITION BASED ANALYSIS")
+    print(f"Regime Labeling: HIERARCHICAL CLUSTERING")
     print("=" * 80)
 
     # 1. Data ingestion & feature engineering
@@ -443,13 +508,16 @@ def main():
     model, hidden_states = train_hmm(X_scaled, Config.N_STATES)
     df['Regime'] = hidden_states
 
-    # 4. Regime labeling (using transition based approach)
+    # 4. Regime labeling (using hierarchical clustering)
     real_means = scaler.inverse_transform(model.means_)
     state_stats = pd.DataFrame(real_means, columns=['Log_Ret', 'Log_Range', 'Rolling_AUC'])
     state_stats['State'] = range(Config.N_STATES)
 
-    labels = label_regimes_transition_based(state_stats, model.transmat_, Config.N_STATES)
+    labels, features_scaled = label_regimes_clustering(state_stats, model.transmat_, Config.N_STATES)
     df['Regime_Label'] = df['Regime'].map(labels)
+
+    # 4.5. Plot dendrogram
+    plot_dendrogram(features_scaled, state_stats, labels)
 
     # 5. Forward algorithm
     print("\n" + "=" * 80)
@@ -480,7 +548,7 @@ def main():
 
     print(f"\nCurrent State Probabilities (Latest Observation):")
     for i in range(Config.N_STATES):
-        print(f"  {labels[i]:30s}: {current_state_probs[i]:.4f}")
+        print(f"  {labels[i]:40s}: {current_state_probs[i]:.4f}")
 
     print(f"\nForecasted State Probabilities (Next {Config.FORECAST_STEPS} Days):")
     print(forecast_df.round(4))
@@ -490,9 +558,8 @@ def main():
     print("\nMost Likely Regime by Day:")
     for day, regime in most_likely.items():
         prob = forecast_df.loc[day, regime]
-        # Handle case where prob might be a Series (duplicate column names)
         if isinstance(prob, pd.Series):
-            prob = prob.iloc[0]  # Take first value if multiple columns match
+            prob = prob.iloc[0]
         print(f"  {day}: {regime} ({prob:.2%})")
 
     # 7. Transition matrix analysis
@@ -512,7 +579,6 @@ def main():
     print_regime_distribution(df)
     print_returns_by_regime(df)
     print_stationary_distribution(model, labels)
-
 
 
 if __name__ == "__main__":
